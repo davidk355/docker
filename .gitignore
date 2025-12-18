@@ -1,0 +1,11 @@
+# Docker credentials - DO NOT COMMIT
+.docker-credentials
+
+# macOS
+.DS_Store
+
+# Editor
+*.swp
+*.swo
+*~
+
