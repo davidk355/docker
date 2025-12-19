@@ -10,7 +10,24 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
+MAGENTA='\033[0;35m'
 NC='\033[0m' # No Color
+
+# Debug mode (can be overridden by config file)
+DEBUG=false
+
+# Config file path (defined early so we can load DEBUG setting)
+CONFIG_FILE="$(dirname "$0")/.docker-credentials"
+
+# Load DEBUG setting early if config exists
+if [[ -f "$CONFIG_FILE" ]]; then
+    # Extract just the DEBUG setting without loading credentials yet
+    DEBUG_SETTING=$(grep "^DEBUG=" "$CONFIG_FILE" 2>/dev/null | cut -d'=' -f2 | tr -d '"' | tr -d "'")
+    if [[ "$DEBUG_SETTING" == "true" ]]; then
+        DEBUG=true
+        echo -e "\033[0;35m[DEBUG]\033[0m Debug mode enabled from config file"
+    fi
+fi
 
 print_status() {
     echo -e "${BLUE}[INFO]${NC} $1"
@@ -28,20 +45,31 @@ print_error() {
     echo -e "${RED}[ERROR]${NC} $1"
 }
 
+print_debug() {
+    if [[ "$DEBUG" == true ]]; then
+        echo -e "${MAGENTA}[DEBUG]${NC} $1"
+    fi
+}
+
 # Step 1 & 2 & 3: Check for Homebrew, then Docker
 check_and_install_homebrew() {
     if ! command -v brew &> /dev/null; then
         print_warning "Homebrew is not installed."
         print_status "Installing Homebrew..."
+        print_debug "Executing: /bin/bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\""
         /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
         
         # Add Homebrew to PATH for Apple Silicon Macs
         if [[ $(uname -m) == "arm64" ]]; then
+            print_debug "Executing: eval \"\$(/opt/homebrew/bin/brew shellenv)\""
             eval "$(/opt/homebrew/bin/brew shellenv)"
         fi
         
         print_success "Homebrew installed successfully!"
     else
+        print_debug "Executing: brew --version"
+        BREW_VERSION=$(brew --version 2>/dev/null | head -n 1)
+        print_debug "Output: $BREW_VERSION"
         print_success "Homebrew is already installed."
     fi
 }
@@ -50,25 +78,52 @@ check_and_install_docker() {
     if ! command -v docker &> /dev/null; then
         print_warning "Docker CLI is not installed."
         print_status "Installing Docker via Homebrew..."
+        print_debug "Executing: brew install --cask docker"
         brew install --cask docker
         print_success "Docker installed successfully!"
         print_warning "Please start Docker Desktop from your Applications folder before continuing."
         read -p "Press Enter once Docker Desktop is running..."
     else
+        print_debug "Executing: docker --version"
+        DOCKER_VERSION=$(docker --version 2>/dev/null)
+        print_debug "Output: $DOCKER_VERSION"
         print_success "Docker CLI is already installed."
     fi
     
     # Verify Docker daemon is running
+    print_debug "Executing: docker info"
     if ! docker info &> /dev/null; then
         print_error "Docker daemon is not running. Please start Docker Desktop and try again."
         exit 1
     fi
+    print_debug "Output: Docker daemon responded successfully"
     
     print_success "Docker daemon is running."
 }
 
-# Config file path
-CONFIG_FILE="$(dirname "$0")/.docker-credentials"
+check_and_install_trivy() {
+    if ! command -v trivy &> /dev/null; then
+        print_warning "Trivy is not installed."
+        print_status "Installing Trivy via Homebrew..."
+        print_debug "Executing: brew install trivy"
+        brew install trivy
+        
+        if [[ $? -eq 0 ]]; then
+            print_success "Trivy installed successfully!"
+        else
+            print_error "Failed to install Trivy."
+            exit 1
+        fi
+    else
+        print_success "Trivy is already installed."
+    fi
+    
+    # Display Trivy version
+    print_debug "Executing: trivy --version"
+    TRIVY_VERSION=$(trivy --version 2>/dev/null | head -n 1)
+    print_debug "Output: $TRIVY_VERSION"
+    print_status "Trivy version: $TRIVY_VERSION"
+}
 
 # Step 4: Ask for Docker Hub access token and login
 docker_hub_login() {
@@ -99,25 +154,41 @@ docker_hub_login() {
             # Load credentials from config file
             source "$CONFIG_FILE"
             
+            # Debug: show loaded config values
+            print_debug "Loaded from config: TOKEN_TYPE=$TOKEN_TYPE"
+            print_debug "Loaded from config: DEBUG=$DEBUG"
+            print_debug "Loaded from config: DOCKER_ORG=$DOCKER_ORG"
+            print_debug "Loaded from config: DOCKER_USERNAME=$DOCKER_USERNAME"
+            print_debug "Loaded from config: DOCKER_TOKEN=$DOCKER_TOKEN"
+            
             # Use DOCKER_ORG for OAT tokens, fall back to DOCKER_USERNAME for backward compatibility
             if [[ "$TOKEN_TYPE" == "oat" && -n "$DOCKER_ORG" ]]; then
-                CONFIG_USERNAME="$DOCKER_ORG"
+                CONFIG_NAMESPACE="$DOCKER_ORG"
             elif [[ -n "$DOCKER_USERNAME" ]]; then
-                CONFIG_USERNAME="$DOCKER_USERNAME"
+                CONFIG_NAMESPACE="$DOCKER_USERNAME"
             else
-                CONFIG_USERNAME=""
+                CONFIG_NAMESPACE=""
             fi
             
-            if [[ -n "$CONFIG_USERNAME" && -n "$DOCKER_TOKEN" && "$DOCKER_TOKEN" != "your-token-here" ]]; then
-                print_status "Using credentials for organization: $CONFIG_USERNAME"
+            print_debug "Resolved CONFIG_NAMESPACE=$CONFIG_NAMESPACE"
+            
+            if [[ -n "$CONFIG_NAMESPACE" && -n "$DOCKER_TOKEN" && "$DOCKER_TOKEN" != "your-token-here" ]]; then
+                print_status "Using credentials for organization: $CONFIG_NAMESPACE"
                 
                 # Login to Docker Hub
-                echo "$DOCKER_TOKEN" | docker login -u "$CONFIG_USERNAME" --password-stdin
+                # Note: We always suppress stderr because Docker Desktop's credential helper
+                # produces a misleading "Cannot log into an organization account" warning
+                # even when OAT login succeeds. The warning is from Docker Desktop, not our login.
+                print_debug "Executing: docker login -u \"$CONFIG_NAMESPACE\" --password-stdin"
+                LOGIN_OUTPUT=$(echo "$DOCKER_TOKEN" | docker login -u "$CONFIG_NAMESPACE" --password-stdin 2>/dev/null)
+                LOGIN_EXIT_CODE=$?
+                print_debug "Output: $LOGIN_OUTPUT"
+                print_debug "Exit code: $LOGIN_EXIT_CODE"
                 
-                if [[ $? -eq 0 ]]; then
+                if [[ $LOGIN_EXIT_CODE -eq 0 ]]; then
                     print_success "Successfully logged in to Docker Hub!"
                     LOGGED_IN=true
-                    STORED_USERNAME="$CONFIG_USERNAME"
+                    STORED_NAMESPACE="$CONFIG_NAMESPACE"
                     STORED_TOKEN="$DOCKER_TOKEN"
                     
                     # Set ORG_MODE based on token type
@@ -179,13 +250,20 @@ docker_hub_login() {
     fi
     
     # Login to Docker Hub
-    echo "$DOCKER_TOKEN" | docker login -u "$DOCKER_USERNAME" --password-stdin
+    # Note: We always suppress stderr because Docker Desktop's credential helper
+    # produces a misleading "Cannot log into an organization account" warning
+    # even when OAT login succeeds. The warning is from Docker Desktop, not our login.
+    print_debug "Executing: docker login -u \"$DOCKER_USERNAME\" --password-stdin"
+    LOGIN_OUTPUT=$(echo "$DOCKER_TOKEN" | docker login -u "$DOCKER_USERNAME" --password-stdin 2>/dev/null)
+    LOGIN_EXIT_CODE=$?
+    print_debug "Output: $LOGIN_OUTPUT"
+    print_debug "Exit code: $LOGIN_EXIT_CODE"
     
-    if [[ $? -eq 0 ]]; then
+    if [[ $LOGIN_EXIT_CODE -eq 0 ]]; then
         print_success "Successfully logged in to Docker Hub!"
         LOGGED_IN=true
         # Store credentials for API calls
-        STORED_USERNAME="$DOCKER_USERNAME"
+        STORED_NAMESPACE="$DOCKER_USERNAME"
         STORED_TOKEN="$DOCKER_TOKEN"
         
         # Offer to save credentials
@@ -196,6 +274,9 @@ docker_hub_login() {
                 cat > "$CONFIG_FILE" << EOF
 # Docker Hub Credentials
 # This file is ignored by git - safe to store credentials here
+
+# Debug mode: set to true to see detailed curl commands and responses
+DEBUG=false
 
 # Token type: "oat" for Organization Access Token, "pat" for Personal Access Token
 TOKEN_TYPE="oat"
@@ -210,6 +291,9 @@ EOF
                 cat > "$CONFIG_FILE" << EOF
 # Docker Hub Credentials
 # This file is ignored by git - safe to store credentials here
+
+# Debug mode: set to true to see detailed curl commands and responses
+DEBUG=false
 
 # Token type: "oat" for Organization Access Token, "pat" for Personal Access Token
 TOKEN_TYPE="pat"
@@ -237,6 +321,7 @@ manage_existing_images() {
     echo ""
     
     # Get list of local images
+    print_debug "Executing: docker images --format \"{{.Repository}}:{{.Tag}}\t{{.ID}}\t{{.Size}}\""
     LOCAL_IMAGES=$(docker images --format "{{.Repository}}:{{.Tag}}\t{{.ID}}\t{{.Size}}" 2>/dev/null)
     
     if [[ -z "$LOCAL_IMAGES" ]]; then
@@ -306,13 +391,17 @@ manage_existing_images() {
         echo -n "Removing [$num] $IMAGE_NAME... "
         
         # First, stop and remove any containers using this image
+        print_debug "Executing: docker ps -a -q --filter ancestor=\"$IMAGE_ID\""
         CONTAINERS=$(docker ps -a -q --filter ancestor="$IMAGE_ID" 2>/dev/null)
         if [[ -n "$CONTAINERS" ]]; then
+            print_debug "Executing: docker stop $CONTAINERS"
             docker stop $CONTAINERS >/dev/null 2>&1
+            print_debug "Executing: docker rm $CONTAINERS"
             docker rm $CONTAINERS >/dev/null 2>&1
         fi
         
         # Remove the image (force to handle dependencies)
+        print_debug "Executing: docker rmi -f \"$IMAGE_ID\""
         if docker rmi -f "$IMAGE_ID" >/dev/null 2>&1; then
             echo -e "${GREEN}Done${NC}"
             ((IMAGES_REMOVED++))
@@ -328,10 +417,106 @@ manage_existing_images() {
         
         # Clean up any dangling images and build cache
         print_status "Cleaning up unused data..."
+        print_debug "Executing: docker system prune -f"
         docker system prune -f >/dev/null 2>&1
         print_success "Cleanup complete."
     else
         print_status "No images were removed."
+    fi
+}
+
+# Scan local images with Trivy
+trivy_scan_image() {
+    echo ""
+    print_status "Trivy Security Scan"
+    echo ""
+    
+    # Get list of local images
+    print_debug "Executing: docker images --format \"{{.Repository}}:{{.Tag}}\t{{.ID}}\t{{.Size}}\""
+    LOCAL_IMAGES=$(docker images --format "{{.Repository}}:{{.Tag}}\t{{.ID}}\t{{.Size}}" 2>/dev/null)
+    
+    if [[ -z "$LOCAL_IMAGES" ]]; then
+        print_status "No local Docker images found to scan."
+        return
+    fi
+    
+    echo -e "${BLUE}Available images for security scan:${NC}"
+    echo ""
+    printf "%-5s %-40s %-15s %s\n" "#" "IMAGE" "ID" "SIZE"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    
+    # Display images with numbers and store in arrays
+    SCAN_IMAGE_COUNT=0
+    declare -a SCAN_IMAGE_NAMES
+    declare -a SCAN_IMAGE_IDS
+    
+    while IFS=$'\t' read -r name id size; do
+        ((SCAN_IMAGE_COUNT++))
+        SCAN_IMAGE_NAMES[$SCAN_IMAGE_COUNT]="$name"
+        SCAN_IMAGE_IDS[$SCAN_IMAGE_COUNT]="$id"
+        printf "%-5s %-40s %-15s %s\n" "[$SCAN_IMAGE_COUNT]" "$name" "${id:0:12}" "$size"
+    done <<< "$LOCAL_IMAGES"
+    
+    echo ""
+    
+    if [[ $SCAN_IMAGE_COUNT -eq 0 ]]; then
+        print_status "No local Docker images found to scan."
+        return
+    fi
+    
+    echo -e "${YELLOW}Enter an image number to scan with Trivy, or press Enter to skip.${NC}"
+    echo ""
+    read -p "Select image to scan: " SCAN_SELECTION
+    
+    if [[ -z "$SCAN_SELECTION" ]]; then
+        print_status "Skipping Trivy scan."
+        return
+    fi
+    
+    # Validate selection
+    if ! [[ "$SCAN_SELECTION" =~ ^[0-9]+$ ]]; then
+        print_error "Invalid selection: '$SCAN_SELECTION'"
+        return
+    fi
+    
+    if [[ $SCAN_SELECTION -lt 1 || $SCAN_SELECTION -gt $SCAN_IMAGE_COUNT ]]; then
+        print_error "Invalid selection: $SCAN_SELECTION (valid: 1-$SCAN_IMAGE_COUNT)"
+        return
+    fi
+    
+    SCAN_IMAGE_NAME="${SCAN_IMAGE_NAMES[$SCAN_SELECTION]}"
+    print_debug "Selected image: $SCAN_IMAGE_NAME"
+    
+    echo ""
+    echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${BLUE}Select scan type:${NC}"
+    echo -e "${BLUE}  [1] Quick scan (vulnerabilities only)${NC}"
+    echo -e "${BLUE}  [2] Full scan (vulnerabilities + secrets + misconfigurations)${NC}"
+    echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+    read -p "Select scan type (1 or 2, default: 1): " SCAN_TYPE
+    
+    echo ""
+    print_status "Scanning image: $SCAN_IMAGE_NAME"
+    echo ""
+    
+    if [[ "$SCAN_TYPE" == "2" ]]; then
+        print_status "Running full Trivy scan (this may take a while)..."
+        print_debug "Executing: trivy image --scanners vuln,secret,misconfig \"$SCAN_IMAGE_NAME\""
+        trivy image --scanners vuln,secret,misconfig "$SCAN_IMAGE_NAME"
+    else
+        print_status "Running quick Trivy vulnerability scan..."
+        print_debug "Executing: trivy image \"$SCAN_IMAGE_NAME\""
+        trivy image "$SCAN_IMAGE_NAME"
+    fi
+    
+    SCAN_EXIT_CODE=$?
+    
+    echo ""
+    if [[ $SCAN_EXIT_CODE -eq 0 ]]; then
+        print_success "Trivy scan completed for $SCAN_IMAGE_NAME"
+    else
+        print_warning "Trivy scan completed with findings for $SCAN_IMAGE_NAME"
     fi
 }
 
@@ -344,10 +529,10 @@ list_docker_images() {
     SEARCH_COUNT=0
     
     # If logged in, offer to show organization images
-    if [[ "$LOGGED_IN" == true && -n "$STORED_USERNAME" ]]; then
+    if [[ "$LOGGED_IN" == true && -n "$STORED_NAMESPACE" ]]; then
         echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
         echo -e "${BLUE}Choose image source:${NC}"
-        echo -e "${BLUE}  [1] Your organization's images ($STORED_USERNAME)${NC}"
+        echo -e "${BLUE}  [1] Your organization's images ($STORED_NAMESPACE)${NC}"
         echo -e "${BLUE}  [2] Search public Docker Hub images${NC}"
         echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
         echo ""
@@ -366,31 +551,127 @@ list_docker_images() {
 # List organization's private images
 list_org_images() {
     echo ""
-    print_status "Organization image mode for '$STORED_USERNAME'"
-    echo ""
-    
-    # Docker Hub API limitation: Organization Access Tokens can't list repos via API
-    # But they CAN pull images. So we let the user enter the image name directly.
-    
-    echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "${YELLOW}Note: Docker Hub's API doesn't support listing private repos${NC}"
-    echo -e "${YELLOW}with Organization Access Tokens.${NC}"
-    echo -e "${YELLOW}${NC}"
-    echo -e "${YELLOW}But you CAN pull images! Just enter the repository name.${NC}"
-    echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo ""
-    echo -e "${GREEN}Example:${NC}"
-    echo -e "${GREEN}  Image name:  fsai-os-frontend${NC}"
-    echo -e "${GREEN}  Tag:         v1.14.1${NC}"
-    echo -e "${GREEN}  Result:      ${STORED_USERNAME}/fsai-os-frontend:v1.14.1${NC}"
+    print_status "Fetching repositories for '$STORED_NAMESPACE'..."
     echo ""
     
     # Set org mode flag for pull function
     ORG_MODE=true
+    
+    REPO_NAMES=""
+    
+    # Method 1: Try Basic Auth (works best for OAT tokens)
+    # Format: curl -u "<org-name>:<oat-token>" 
+    print_status "Trying Basic authentication..."
+    
+    BASIC_AUTH_URL="https://hub.docker.com/v2/repositories/${STORED_NAMESPACE}/?page_size=100"
+    print_debug "Executing: curl -s -u \"${STORED_NAMESPACE}:${STORED_TOKEN}\" \"${BASIC_AUTH_URL}\""
+    
+    REPOS_RESPONSE=$(curl -s -u "${STORED_NAMESPACE}:${STORED_TOKEN}" \
+        "${BASIC_AUTH_URL}" 2>/dev/null)
+    
+    print_debug "Response (first 500 chars): ${REPOS_RESPONSE:0:500}"
+    
+    REPO_NAMES=$(echo "$REPOS_RESPONSE" | grep -o '"name":"[^"]*"' | cut -d'"' -f4 | head -50)
+    
+    print_debug "Parsed REPO_NAMES: $REPO_NAMES"
+    
+    if [[ -n "$REPO_NAMES" ]]; then
+        print_success "Basic authentication successful!"
+    elif [[ "$TOKEN_TYPE" == "oat" ]]; then
+        # OAT tokens can only use Basic auth - JWT/Bearer won't work for org accounts
+        print_warning "Basic auth didn't return results for OAT token."
+        print_status "Note: Docker Hub API may not support listing repos with OAT tokens."
+    else
+        # Method 2: Try JWT token authentication (works for PAT tokens only)
+        print_warning "Basic auth didn't return results. Trying JWT authentication..."
+        
+        JWT_URL="https://hub.docker.com/v2/users/login/"
+        print_debug "Executing: curl -s -X POST -H \"Content-Type: application/json\" -d '{\"username\": \"$STORED_NAMESPACE\", ...}' \"${JWT_URL}\""
+        
+        JWT_RESPONSE=$(curl -s -X POST \
+            -H "Content-Type: application/json" \
+            -d "{\"username\": \"$STORED_NAMESPACE\", \"password\": \"$STORED_TOKEN\"}" \
+            "${JWT_URL}" 2>/dev/null)
+        
+        print_debug "JWT Response (first 200 chars): ${JWT_RESPONSE:0:200}"
+        
+        JWT_TOKEN=$(echo "$JWT_RESPONSE" | grep -o '"token":"[^"]*"' | cut -d'"' -f4)
+        
+        if [[ -n "$JWT_TOKEN" ]]; then
+            print_success "JWT authentication successful!"
+            
+            REPOS_URL="https://hub.docker.com/v2/repositories/$STORED_NAMESPACE/?page_size=100"
+            print_debug "Executing: curl -s -H \"Authorization: JWT ${JWT_TOKEN}\" \"${REPOS_URL}\""
+            
+            REPOS_RESPONSE=$(curl -s \
+                -H "Authorization: JWT $JWT_TOKEN" \
+                "${REPOS_URL}" 2>/dev/null)
+            
+            print_debug "Response (first 500 chars): ${REPOS_RESPONSE:0:500}"
+            
+            REPO_NAMES=$(echo "$REPOS_RESPONSE" | grep -o '"name":"[^"]*"' | cut -d'"' -f4 | head -50)
+        else
+            # Method 3: Try Bearer token directly
+            print_warning "JWT auth failed. Trying Bearer token..."
+            
+            REPOS_URL="https://hub.docker.com/v2/repositories/$STORED_NAMESPACE/?page_size=100"
+            print_debug "Executing: curl -s -H \"Authorization: Bearer ${STORED_TOKEN}\" \"${REPOS_URL}\""
+            
+            REPOS_RESPONSE=$(curl -s \
+                -H "Authorization: Bearer $STORED_TOKEN" \
+                "${REPOS_URL}" 2>/dev/null)
+            
+            print_debug "Response (first 500 chars): ${REPOS_RESPONSE:0:500}"
+            
+            REPO_NAMES=$(echo "$REPOS_RESPONSE" | grep -o '"name":"[^"]*"' | cut -d'"' -f4 | head -50)
+        fi
+    fi
+    
+    if [[ -z "$REPO_NAMES" ]]; then
+        # API listing failed - fall back to manual entry
+        echo ""
+        echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+        echo -e "${YELLOW}Could not fetch repository list via API.${NC}"
+        echo -e "${YELLOW}This may happen with Organization Access Tokens (OAT).${NC}"
+        echo -e "${YELLOW}${NC}"
+        echo -e "${YELLOW}But you CAN still pull images! Just enter the repository name.${NC}"
+        echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+        echo ""
+        echo -e "${GREEN}Example:${NC}"
+        echo -e "${GREEN}  Image name:  fsai-os-frontend${NC}"
+        echo -e "${GREEN}  Tag:         v1.14.1${NC}"
+        echo -e "${GREEN}  Result:      ${STORED_NAMESPACE}/fsai-os-frontend:v1.14.1${NC}"
+        echo ""
+        
+        SEARCH_COUNT=0
+        
+        echo -e "${BLUE}To see your organization's repositories, visit:${NC}"
+        echo -e "${BLUE}https://hub.docker.com/u/${STORED_NAMESPACE}${NC}"
+        echo ""
+        return
+    fi
+    
+    # Successfully got repository list - display them
+    print_success "Found repositories for $STORED_NAMESPACE"
+    echo ""
+    
+    printf "%-5s %-50s\n" "#" "REPOSITORY"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    
+    # Store repos in temp file for selection
+    SEARCH_RESULTS_FILE=$(mktemp)
     SEARCH_COUNT=0
     
-    echo -e "${BLUE}To see your organization's repositories, visit:${NC}"
-    echo -e "${BLUE}https://hub.docker.com/u/${STORED_USERNAME}${NC}"
+    while IFS= read -r repo; do
+        if [[ -n "$repo" ]]; then
+            ((SEARCH_COUNT++))
+            echo "${STORED_NAMESPACE}/${repo}" >> "$SEARCH_RESULTS_FILE"
+            printf "%-5s %-50s\n" "[$SEARCH_COUNT]" "${STORED_NAMESPACE}/${repo}"
+        fi
+    done <<< "$REPO_NAMES"
+    
+    echo ""
+    print_status "Found $SEARCH_COUNT repository(ies)."
     echo ""
 }
 
@@ -412,6 +693,7 @@ search_public_images() {
     printf "%-5s %-40s %s\n" "#" "NAME" "DESCRIPTION"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     
+    print_debug "Executing: docker search \"$SEARCH_TERM\" --limit 20"
     docker search "$SEARCH_TERM" --limit 20 2>/dev/null | while IFS= read -r line; do
         # Skip the header line
         if [[ "$line" == NAME* ]]; then
@@ -477,7 +759,7 @@ pull_docker_image() {
         
         # In org mode, auto-prepend org name if not included
         if [[ "$ORG_MODE" == true && "$IMAGE_NAME" != *"/"* ]]; then
-            IMAGE_NAME="${STORED_USERNAME}/${IMAGE_NAME}"
+            IMAGE_NAME="${STORED_NAMESPACE}/${IMAGE_NAME}"
             print_status "Using full image name: $IMAGE_NAME"
         fi
     fi
@@ -513,7 +795,9 @@ pull_docker_image() {
         fi
         
         # Fetch tags from Docker Hub API
+        print_debug "Executing: curl -s \"$API_URL\""
         TAGS_RESPONSE=$(curl -s "$API_URL" 2>/dev/null)
+        print_debug "Response (first 300 chars): ${TAGS_RESPONSE:0:300}"
         
         # Parse and display tags
         TAGS_FILE=$(mktemp)
@@ -575,17 +859,20 @@ pull_docker_image() {
     
     echo ""
     print_status "Pulling image: $IMAGE_NAME"
+    print_debug "Executing: docker pull \"$IMAGE_NAME\""
     docker pull "$IMAGE_NAME"
     
     if [[ $? -eq 0 ]]; then
         print_success "Successfully pulled $IMAGE_NAME!"
         echo ""
         print_status "Your local Docker images:"
+        print_debug "Executing: docker images"
         docker images
         
         # Open Docker Desktop GUI
         echo ""
         print_status "Opening Docker Desktop..."
+        print_debug "Executing: open -a Docker"
         open -a Docker
         print_success "Docker Desktop launched! You can view your images in the GUI."
     else
@@ -606,12 +893,16 @@ main() {
     LOGGED_IN=false
     ORG_MODE=false
     
-    # Step 1-3: Ensure Homebrew and Docker are installed
+    # Step 1-3: Ensure Homebrew, Docker, and Trivy are installed
     check_and_install_homebrew
     check_and_install_docker
+    check_and_install_trivy
     
     # Step 4: Manage existing local images (before login)
     manage_existing_images
+    
+    # Step 4b: Offer Trivy security scan of local images
+    trivy_scan_image
     
     # Step 5: Docker Hub authentication (optional)
     docker_hub_login
